@@ -159,69 +159,69 @@ void clear_renderer(Renderer* renderer) {
 #include <float.h>  // Add this to resolve FLT_MAX
 #include <math.h>   // Ensure you have this for math functions like fminf, fmaxf
 
-void render_scene(Renderer* renderer, Splat* splats, int splat_count, Camera* camera, DebugMode debug_mode, int debug_limit) {
-    // Clear the framebuffer and depthbuffer efficiently
-    memset(renderer->framebuffer, 0, renderer->width * renderer->height * 3 * sizeof(unsigned char));
+#include <immintrin.h>  // For SSE intrinsics
+#include <omp.h>        // For OpenMP parallelization
 
-    // Initialize the depth buffer with INFINITY
-    for (int i = 0; i < renderer->width * renderer->height; i++) {
-        renderer->depthbuffer[i] = INFINITY;
+void render_scene(Renderer* renderer, Splat* splats, int splat_count, Camera* camera, DebugMode debug_mode, int debug_limit) {
+    // Clear the framebuffer and depthbuffer efficiently using memset
+    memset(renderer->framebuffer, 0, renderer->width * renderer->height * 3 * sizeof(unsigned char));
+    
+    // Use SSE to initialize the depth buffer with INFINITY
+    __m128 inf = _mm_set1_ps(INFINITY);
+    for (int i = 0; i < renderer->width * renderer->height; i += 4) {
+        _mm_store_ps(&renderer->depthbuffer[i], inf);
     }
 
-    int visible_splats = 0;
-    int splats_behind_camera = 0;
-    int splats_outside_screen = 0;
+    int visible_splats = 0, splats_behind_camera = 0, splats_outside_screen = 0;
     bool debug_enabled = (debug_mode != DEBUG_NONE);
     int debug_count = 0;
 
     // Precompute useful values
-    float half_width = renderer->width / 2.0f;
-    float half_height = renderer->height / 2.0f;
-
-    float fov = 90.0f;  // Field of view in degrees
+    float half_width = renderer->width * 0.5f;
+    float half_height = renderer->height * 0.5f;
+    float fov_tan = tanf(45.0f * M_PI / 180.0f);  // Precompute tan(fov/2)
     float aspect_ratio = (float)renderer->width / (float)renderer->height;
 
-    for (int i = 0; i < splat_count; i++) {
-        if (debug_count >= debug_limit) {
-            debug_enabled = false;
-        }
+    // Precompute camera vectors
+    vec3 cam_right = camera->right;
+    vec3 cam_up = camera->up;
+    vec3 cam_front = camera->front;
+    vec3 cam_pos = camera->position;
 
+    #pragma omp parallel for reduction(+:visible_splats,splats_behind_camera,splats_outside_screen) schedule(dynamic, 64)
+    for (int i = 0; i < splat_count; i++) {
         // Transform splat position to camera space
         vec3 pos_cam = {
-            splats[i].x - camera->position.x,
-            splats[i].y - camera->position.y,
-            splats[i].z - camera->position.z
+            splats[i].x - cam_pos.x,
+            splats[i].y - cam_pos.y,
+            splats[i].z - cam_pos.z
         };
 
         vec3 pos_cam_transformed = {
-            pos_cam.x * camera->right.x + pos_cam.y * camera->right.y + pos_cam.z * camera->right.z,
-            pos_cam.x * camera->up.x + pos_cam.y * camera->up.y + pos_cam.z * camera->up.z,
-            pos_cam.x * camera->front.x + pos_cam.y * camera->front.y + pos_cam.z * camera->front.z
+            pos_cam.x * cam_right.x + pos_cam.y * cam_right.y + pos_cam.z * cam_right.z,
+            pos_cam.x * cam_up.x + pos_cam.y * cam_up.y + pos_cam.z * cam_up.z,
+            pos_cam.x * cam_front.x + pos_cam.y * cam_front.y + pos_cam.z * cam_front.z
         };
 
         // Check if the splat is behind the camera
         if (pos_cam_transformed.z <= 0) {
             splats_behind_camera++;
-            if (debug_enabled && (debug_mode & DEBUG_TRANSFORM) && debug_count < debug_limit) {
-                printf("Splat %d is behind the camera: z = %f\n", i, pos_cam_transformed.z);
-            }
             continue;
         }
 
-        // Adjusted Perspective Projection Calculation
-        float scale = tan(fov * 0.5f * M_PI / 180.0f) * pos_cam_transformed.z;
+        // Perspective Projection Calculation
+        float inv_z = 1.0f / pos_cam_transformed.z;
+        float scale = fov_tan * pos_cam_transformed.z;
         float proj_x = (pos_cam_transformed.x / (aspect_ratio * scale)) * half_width + half_width;
         float proj_y = -(pos_cam_transformed.y / scale) * half_height + half_height;
 
         // Calculate splat radius in screen space
-        float radius = splats[i].scale / pos_cam_transformed.z * renderer->width;
+        float radius = splats[i].scale * inv_z * renderer->width;
 
         // Check if the splat is outside the screen bounds
-        if (proj_x + radius < 0 || proj_x - radius >= renderer->width || proj_y + radius < 0 || proj_y - radius >= renderer->height) {
+        if (proj_x + radius < 0 || proj_x - radius >= renderer->width || 
+            proj_y + radius < 0 || proj_y - radius >= renderer->height) {
             splats_outside_screen++;
-            if (debug_enabled && (debug_mode & DEBUG_PROJECTION) && debug_count < debug_limit) {
-                printf("Splat %d is outside screen bounds: proj_x = %f, proj_y = %f, radius = %f\n", i, proj_x, proj_y, radius);
-            }
             continue;
         }
 
@@ -233,39 +233,45 @@ void render_scene(Renderer* renderer, Splat* splats, int splat_count, Camera* ca
         int min_y = (int)fmaxf(0, proj_y - radius);
         int max_y = (int)fminf(renderer->height - 1, proj_y + radius);
 
+        float inv_radius = 1.0f / radius;
+        __m128 splat_color = _mm_set_ps(splats[i].a, splats[i].b * 255.0f, splats[i].g * 255.0f, splats[i].r * 255.0f);
+        __m128 pos_z = _mm_set1_ps(pos_cam_transformed.z);
+
         for (int y = min_y; y <= max_y; y++) {
+            float dy = (y - proj_y) * inv_radius;
+            float dy_sq = dy * dy;
+
             for (int x = min_x; x <= max_x; x++) {
-                float dx = (x - proj_x) / radius;
-                float dy = (y - proj_y) / radius;
-                float dist_sq = dx * dx + dy * dy;
+                float dx = (x - proj_x) * inv_radius;
+                float dist_sq = dx * dx + dy_sq;
 
                 if (dist_sq <= 1.0f) {
-                    int buffer_index = (y * renderer->width + x) * 3;
+                    int buffer_index = (y * renderer->width + x);
+                    float* depth = &renderer->depthbuffer[buffer_index];
 
-                    if (pos_cam_transformed.z < renderer->depthbuffer[y * renderer->width + x]) {
+                    if (pos_cam_transformed.z < *depth) {
                         float alpha = splats[i].a * expf(-dist_sq);
-                        unsigned char* pixel = &renderer->framebuffer[buffer_index];
+                        unsigned char* pixel = &renderer->framebuffer[buffer_index * 3];
 
-                        pixel[0] = (unsigned char)((1.0f - alpha) * pixel[0] + alpha * (splats[i].r * 255.0f));
-                        pixel[1] = (unsigned char)((1.0f - alpha) * pixel[1] + alpha * (splats[i].g * 255.0f));
-                        pixel[2] = (unsigned char)((1.0f - alpha) * pixel[2] + alpha * (splats[i].b * 255.0f));
+                        __m128 curr_color = _mm_set_ps(1.0f, pixel[2], pixel[1], pixel[0]);
+                        __m128 alpha_vec = _mm_set1_ps(alpha);
+                        __m128 result = _mm_add_ps(
+                            _mm_mul_ps(_mm_sub_ps(_mm_set1_ps(1.0f), alpha_vec), curr_color),
+                            _mm_mul_ps(alpha_vec, splat_color)
+                        );
 
-                        renderer->depthbuffer[y * renderer->width + x] = pos_cam_transformed.z;
+                        _mm_store_ss(depth, pos_z);
+                        __m128i result_int = _mm_cvtps_epi32(result);
+                        pixel[0] = _mm_extract_epi8(result_int, 0);
+                        pixel[1] = _mm_extract_epi8(result_int, 4);
+                        pixel[2] = _mm_extract_epi8(result_int, 8);
                     }
                 }
             }
         }
-
-        if (debug_enabled && (debug_mode & DEBUG_RENDERING) && debug_count < debug_limit) {
-            printf("Rendered splat %d with radius %f\n", i, radius);
-        }
-
-        if (debug_enabled) {
-            debug_count++;
-        }
     }
 
-    // Summary Logging: Print the total number of splats behind the camera and outside the screen
+    // Summary Logging
     printf("Total splats behind camera: %d\n", splats_behind_camera);
     printf("Total splats outside screen bounds: %d\n", splats_outside_screen);
     printf("Visible splats: %d\n", visible_splats);
